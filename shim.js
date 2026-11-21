@@ -39,11 +39,13 @@ function startRender(html, resolution) {
   }
   const proc = spawn("hyperframes", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   job.proc = proc;
+  job.timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch (e) {} if (job.status === "running") { job.status = "failed"; job.error = "render timed out after 10 minutes"; } }, 600000);
   let stderr = "";
   proc.stdout.on("data", () => {});
   proc.stderr.on("data", (d) => { stderr += d.toString(); });
 
   proc.on("close", (code) => {
+    if (job.timer) { clearTimeout(job.timer); job.timer = null; }
     if (code === 0 && fs.existsSync(outFile) && fs.statSync(outFile).size > 0) {
       job.status = "done";
     } else {
