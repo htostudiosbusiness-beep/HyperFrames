@@ -6,7 +6,10 @@ const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 
 const PORT = 8082;
-const jobs = new Map();
+// Only the live child process handles are kept in memory. Job STATE lives on
+// disk under /tmp/hf-<id>, so any shim instance can answer /render/:id and
+// serve the finished file (the previous in-memory Map broke with >1 instance).
+const processes = new Map();
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -23,39 +26,82 @@ function readBody(req) {
   });
 }
 
-function startRender(html, resolution) {
+function jobDir(id) {
+  return path.join(os.tmpdir(), `hf-${id}`);
+}
+function statusFile(id) {
+  return path.join(jobDir(id), "status.json");
+}
+function writeStatus(id, status, error) {
+  fs.writeFileSync(statusFile(id), JSON.stringify({ status, error: error || null }));
+}
+function readStatus(id) {
+  try {
+    return JSON.parse(fs.readFileSync(statusFile(id), "utf8"));
+  } catch (e) {
+    return null;
+  }
+}
+
+function safeName(name) {
+  const base = path.basename(String(name || "media"));
+  return base.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120) || "media";
+}
+
+function startRender(html, resolution, media) {
   const id = crypto.randomUUID();
-  const dir = path.join(os.tmpdir(), `hf-${id}`);
+  const dir = jobDir(id);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "index.html"), html, "utf8");
-  const outFile = path.join(dir, "output.mp4");
 
-  const job = { id, dir, outFile, status: "running", error: null, proc: null };
-  jobs.set(id, job);
+  // Write the submitted media bundle into the render project so the HTML can
+  // use relative src="media/<name>" paths the local browser can always load.
+  if (Array.isArray(media) && media.length) {
+    fs.mkdirSync(path.join(dir, "media"), { recursive: true });
+    for (const item of media.slice(0, 12)) {
+      const name = safeName(item && item.name);
+      const data = item && typeof item.data === "string" ? item.data : "";
+      if (!name || !data) continue;
+      try {
+        fs.writeFileSync(path.join(dir, "media", name), Buffer.from(data, "base64"));
+      } catch (e) {
+        // Ignore a single bad asset; the render can still proceed.
+      }
+    }
+  }
+
+  const outFile = path.join(dir, "output.mp4");
+  writeStatus(id, "running", null);
 
   const args = ["render", "--output", outFile];
   if (resolution && ["portrait", "landscape", "square"].includes(String(resolution).toLowerCase())) {
     args.push("--resolution", String(resolution).toLowerCase());
   }
   const proc = spawn("hyperframes", args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
-  job.proc = proc;
-  job.timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch (e) {} if (job.status === "running") { job.status = "failed"; job.error = "render timed out after 10 minutes"; } }, 600000);
   let stderr = "";
   proc.stdout.on("data", () => {});
   proc.stderr.on("data", (d) => { stderr += d.toString(); });
 
+  const timer = setTimeout(() => {
+    try { proc.kill("SIGKILL"); } catch (e) {}
+    writeStatus(id, "failed", "render timed out after 10 minutes");
+    processes.delete(id);
+  }, 600000);
+  processes.set(id, { proc, timer });
+
   proc.on("close", (code) => {
-    if (job.timer) { clearTimeout(job.timer); job.timer = null; }
+    const entry = processes.get(id);
+    if (entry && entry.timer) clearTimeout(entry.timer);
+    processes.delete(id);
     if (code === 0 && fs.existsSync(outFile) && fs.statSync(outFile).size > 0) {
-      job.status = "done";
+      writeStatus(id, "done", null);
     } else {
-      job.status = "failed";
-      job.error = stderr.trim().slice(-2000) || `hyperframes exited with code ${code}`;
+      writeStatus(id, "failed", stderr.trim().slice(-2000) || `hyperframes exited with code ${code}`);
     }
   });
   proc.on("error", (e) => {
-    job.status = "failed";
-    job.error = String(e);
+    writeStatus(id, "failed", String(e));
+    processes.delete(id);
   });
 
   return id;
@@ -77,7 +123,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof html !== "string" || !html.trim()) {
         return json(res, 400, { error: "html is required" });
       }
-      const id = startRender(html, body.resolution);
+      const id = startRender(html, body.resolution, body.media);
       return json(res, 200, { job_id: id });
     } catch (e) {
       return json(res, 400, { error: String(e) });
@@ -88,23 +134,21 @@ const server = http.createServer(async (req, res) => {
   if (m) {
     const id = decodeURIComponent(m[1]);
     const isFile = pathname.endsWith("/file");
-    const job = jobs.get(id);
-    if (!job) return json(res, 404, { error: "unknown job" });
+    const state = readStatus(id);
+    if (!state) return json(res, 404, { error: "unknown job" });
 
     if (isFile) {
-      if (job.status !== "done" || !fs.existsSync(job.outFile)) {
+      const outFile = path.join(jobDir(id), "output.mp4");
+      if (state.status !== "done" || !fs.existsSync(outFile)) {
         return json(res, 409, { error: "render not ready" });
       }
-      const stat = fs.statSync(job.outFile);
-      res.writeHead(200, {
-        "Content-Type": "video/mp4",
-        "Content-Length": stat.size,
-      });
-      fs.createReadStream(job.outFile).pipe(res);
+      const stat = fs.statSync(outFile);
+      res.writeHead(200, { "Content-Type": "video/mp4", "Content-Length": stat.size });
+      fs.createReadStream(outFile).pipe(res);
       return;
     }
 
-    return json(res, 200, { status: job.status, error: job.error });
+    return json(res, 200, state);
   }
 
   res.writeHead(404, { "Content-Type": "text/plain" });
