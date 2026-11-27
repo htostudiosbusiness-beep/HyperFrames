@@ -2,7 +2,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 
 const PORT = 8082;
@@ -57,13 +57,13 @@ function startRender(html, resolution, media) {
   // Write the submitted media bundle into the render project so the HTML can
   // use relative src="media/<name>" paths the local browser can always load.
   if (Array.isArray(media) && media.length) {
-    fs.mkdirSync(path.join(dir, "media"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "assets"), { recursive: true });
     for (const item of media.slice(0, 12)) {
       const name = safeName(item && item.name);
       const data = item && typeof item.data === "string" ? item.data : "";
       if (!name || !data) continue;
       try {
-        fs.writeFileSync(path.join(dir, "media", name), Buffer.from(data, "base64"));
+        fs.writeFileSync(path.join(dir, "assets", name), Buffer.from(data, "base64"));
       } catch (e) {
         // Ignore a single bad asset; the render can still proceed.
       }
@@ -71,8 +71,33 @@ function startRender(html, resolution, media) {
   }
 
   const outFile = path.join(dir, "output.mp4");
-  writeStatus(id, "running", null);
 
+  // HyperFrames skill contract: `check --json` reports violations with Fix
+  // lines. Fail BEFORE spending a render on a composition the framework will
+  // not animate correctly.
+  const check = spawnSync("npx", ["hyperframes", "check", "--json"], {
+    cwd: dir,
+    encoding: "utf8",
+    timeout: 90000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const checkOutput = `${check.stdout || ""}${check.stderr || ""}`.trim();
+  let hasErrors = false;
+  try {
+    const report = JSON.parse(check.stdout || "{}");
+    const issues = report.errors || report.issues || report.findings || report.violations;
+    hasErrors = Array.isArray(issues)
+      ? issues.some((issue) => issue && (issue.severity === "error" || issue.level === "error"))
+      : check.status !== 0;
+  } catch (e) {
+    hasErrors = check.status !== 0 && checkOutput.length > 0;
+  }
+  if (hasErrors) {
+    writeStatus(id, "failed", `HyperFrames check failed: ${checkOutput.slice(0, 4000)}`);
+    return id;
+  }
+
+  writeStatus(id, "running", null);
   const args = ["render", "--output", outFile];
   if (resolution && ["portrait", "landscape", "square"].includes(String(resolution).toLowerCase())) {
     args.push("--resolution", String(resolution).toLowerCase());
